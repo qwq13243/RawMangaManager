@@ -1,0 +1,12 @@
+playwright==1.48.0
+PySide6
+requests
+Pillow
+numpy
+opencv-python
+torch
+einops
+manga-ocr
+protobuf
+openai
+httpx
