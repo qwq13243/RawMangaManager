@@ -30,6 +30,7 @@ class TranslationWorker(QThread):
             cap_id = task['cap_id']
             base_dir = task['base_dir']
             ch_title = task['ch_title']
+            glossary = task.get('glossary', '') # 获取术语表
             
             chapter_dir = os.path.join(base_dir, ch_title)
             trans_dir = os.path.join(chapter_dir, f"Trans_{ch_title}")
@@ -85,7 +86,7 @@ class TranslationWorker(QThread):
                         if not self.is_cancelled:
                             self.log_signal.emit(msg)
                         
-                        success = self.pipeline.process_image(src_path, dst_path)
+                        success = self.pipeline.process_image(src_path, dst_path, glossary=glossary)
                         if success:
                             msg = f"  - 完成: {img_name}"
                             if not self.is_cancelled:

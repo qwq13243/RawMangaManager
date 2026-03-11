@@ -2,11 +2,14 @@ import os
 import shutil
 import time
 import subprocess
+import re
+import datetime
+
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QScrollArea, QWidget, QFormLayout, 
                                QLineEdit, QPushButton, QHBoxLayout, QCheckBox, QFileDialog, 
                                QFrame, QLabel, QGroupBox, QListWidget, QListWidgetItem, 
                                QTextEdit, QMessageBox, QComboBox, QToolBox, QSpinBox, QApplication)
-from PySide6.QtCore import Qt, QTimer, QUrl, QSize
+from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QEvent
 from PySide6.QtGui import QPixmap, QColor, QDesktopServices
 
 from core.database import db
@@ -262,12 +265,22 @@ class DetailDialog(QDialog):
         
         btn_folder = QPushButton("📂 打开目录")
         btn_folder.clicked.connect(self.open_folder)
+        
+        # 新增：术语表按钮
+        btn_glossary = QPushButton("📖 术语表")
+        btn_glossary.setStyleSheet("background: #FFF9C4; color: #F57F17; font-weight: bold;")
+        btn_glossary.clicked.connect(self.open_glossary_editor)
+
+        btn_import = QPushButton("📥 导入漫画")
+        btn_import.setStyleSheet("background: #E3F2FD; color: #1565C0; font-weight: bold;")
+        btn_import.clicked.connect(self.import_local_chapter)
+        
         btn_delete = QPushButton("❌ 删除记录")
         btn_delete.setStyleSheet("color: red;")
         btn_delete.clicked.connect(self.delete_manga_confirm)
         
         # 修改循环
-        for btn in[btn_refresh, self.btn_trans, btn_folder, btn_delete]:
+        for btn in[btn_refresh, self.btn_trans, btn_folder, btn_glossary, btn_import, btn_delete]:
             btn_layout.addWidget(btn)
         btn_layout.addStretch()
 
@@ -284,6 +297,19 @@ class DetailDialog(QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.itemDoubleClicked.connect(self.on_chapter_double_click)
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self.on_chapter_context_menu)
+        
+        # 启用多选模式与框选功能
+        from PySide6.QtWidgets import QAbstractItemView
+        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_widget.setDragEnabled(False) # 我们不需要拖拽移动，只需要框选
+        
+        # 监听选择变化，同步勾选框
+        self.list_widget.itemSelectionChanged.connect(self.on_selection_changed)
+        
+        # [新增] 安装事件过滤器以拦截空格键
+        self.list_widget.installEventFilter(self)
         
         ctrl_layout = QHBoxLayout()
         # [修改] 替换为是否追更
@@ -317,6 +343,12 @@ class DetailDialog(QDialog):
         self.btn_cancel_trans.setStyleSheet("color: red;")
         self.btn_cancel_trans.clicked.connect(self.cancel_translation)
         
+        btn_scroll_top = QPushButton("⏫ 顶部")
+        btn_scroll_top.clicked.connect(lambda: self.list_widget.verticalScrollBar().setValue(self.list_widget.verticalScrollBar().minimum()))
+
+        btn_scroll_bottom = QPushButton("⏬ 底部")
+        btn_scroll_bottom.clicked.connect(lambda: self.list_widget.verticalScrollBar().setValue(self.list_widget.verticalScrollBar().maximum()))
+        
         ctrl_layout.addWidget(self.chk_follow)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_cancel)
@@ -324,6 +356,8 @@ class DetailDialog(QDialog):
         ctrl_layout.addWidget(btn_dl_sel)
         ctrl_layout.addWidget(self.btn_trans_sel) 
         ctrl_layout.addWidget(btn_dl_all)
+        ctrl_layout.addWidget(btn_scroll_top)
+        ctrl_layout.addWidget(btn_scroll_bottom)
 
         list_layout.addWidget(self.list_widget)
         list_layout.addLayout(ctrl_layout)
@@ -367,38 +401,63 @@ class DetailDialog(QDialog):
             self.log("封面已更新")
 
     def open_reader(self, cap):
-        cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status = cap
+        # [Fix] 解包 10 个参数
+        cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status, chapter_num = cap
         
-        # [修改] 只要下载了就可以阅读，不再强制要求已翻译
-        if not is_dl:
-            self.log(f"章节 {ch_str} 尚未下载，无法阅读。")
-            return
-            
         base_dir = db.get_setting("base_dir")
         folder = self.manga_info['folder_name'] or self.manga_info['title_romaji']
         safe_title = clean_filename(orig_title)
         
-        # 构造生肉目录 (新的两层结构)
-        raw_dir = os.path.join(base_dir, folder, safe_title, safe_title)
-        # 如果新结构不存在，尝试旧结构 (兼容性)
-        if not os.path.exists(raw_dir):
-            raw_dir = os.path.join(base_dir, folder, safe_title)
+        # 1. 优先尝试使用 local_path
+        raw_dir = ""
+        if local_path and os.path.exists(local_path):
+            raw_dir = local_path
+        
+        # 2. 如果 local_path 无效，尝试根据标题推断
+        if not raw_dir or not os.path.exists(raw_dir):
+            # 构造生肉目录 (新的两层结构)
+            raw_dir = os.path.join(base_dir, folder, safe_title, safe_title)
+            # 如果新结构不存在，尝试旧结构 (兼容性)
+            if not os.path.exists(raw_dir):
+                raw_dir = os.path.join(base_dir, folder, safe_title)
 
-        # 构造熟肉目录
-        trans_dir = os.path.join(base_dir, folder, safe_title, f"Trans_{safe_title}")
+        # 构造熟肉目录 (推断)
+        # 如果是 local_path，我们假设熟肉目录在同级或符合命名规范
+        if local_path and os.path.exists(local_path):
+            # 假设 local_path 是 .../safe_title/safe_title
+            parent = os.path.dirname(local_path)
+            trans_dir = os.path.join(parent, f"Trans_{os.path.basename(local_path)}")
+        else:
+            trans_dir = os.path.join(base_dir, folder, safe_title, f"Trans_{safe_title}")
         
         # 确定优先显示的目录：如果有翻译且有文件，优先显示翻译；否则显示生肉
         target_dir = raw_dir
         is_showing_trans = False
         
         import glob
-        valid_exts = ('*.png', '*.jpg', '*.jpeg', '*.webp')
+        valid_exts = ('*.png', '*.jpg', '*.jpeg', '*.webp', '*.bmp', '*.gif', '*.tif', '*.tiff')
         
+        def collect_images(dir_path):
+            if not dir_path or not os.path.exists(dir_path):
+                return []
+            out = []
+            try:
+                # 避免使用 glob.glob，因为路径中的 [local] 等方括号会被误认为是通配符
+                files = os.listdir(dir_path)
+                for f in files:
+                    full = os.path.join(dir_path, f)
+                    if os.path.isfile(full):
+                        # 检查扩展名
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff'):
+                            if "Trans_" not in f:
+                                out.append(full)
+            except Exception as e:
+                self.log(f"读取目录失败: {e}")
+            return out
+
         # 检查翻译目录是否有图片
-        trans_images = []
-        if os.path.exists(trans_dir):
-            for ext in valid_exts:
-                trans_images.extend(glob.glob(os.path.join(trans_dir, ext)))
+        trans_images = collect_images(trans_dir)
         
         if trans_images:
             target_dir = trans_dir
@@ -409,17 +468,30 @@ class DetailDialog(QDialog):
                 self.log(f"找不到章节目录: {raw_dir}")
                 return
             
-            raw_images = []
-            for ext in valid_exts:
-                # 排除 Trans 目录（如果是旧结构，Trans 在 raw_dir 下）
-                files = glob.glob(os.path.join(raw_dir, ext))
-                for f in files:
-                    if "Trans_" not in f:
-                        raw_images.append(f)
+            raw_images = collect_images(raw_dir)
+            
+            # 如果两层目录没找到，尝试退回上一层找 (针对某些旧数据或手动移动的情况)
+            if not raw_images:
+                parent_dir = os.path.dirname(raw_dir)
+                if os.path.exists(parent_dir) and os.path.normpath(parent_dir) != os.path.normpath(base_dir): # 防止回退过头
+                     # 再次检查上一层
+                     raw_images = collect_images(parent_dir)
+                     if raw_images:
+                         raw_dir = parent_dir
             
             if not raw_images:
-                self.log("章节目录下没有找到图片。")
+                self.log(f"章节目录下没有找到图片: {raw_dir}")
+                # 尝试列出目录下文件，辅助调试
+                try:
+                    files = os.listdir(raw_dir)
+                    self.log(f"目录内容: {files[:5]}...")
+                except: pass
                 return
+            
+            # 修复：即使数据库里 is_downloaded 为 0，只要目录有图片也允许阅读
+            if not is_dl:
+                db.mark_chapter_downloaded(cap_id, raw_dir)
+                is_dl = 1
                 
         # 更新阅读状态
         db.update_chapter_read_status(cap_id, 1)
@@ -427,7 +499,7 @@ class DetailDialog(QDialog):
         
         # [修改] 传递 raw_dir 和 trans_dir 给阅读器，支持中键切换
         # 如果 raw_dir 是旧结构（包含 Trans 子目录），阅读器加载时会自动过滤，或者我们在这里传好路径
-        self.reader = MangaReader(target_dir, parent=None, raw_path=raw_dir, trans_path=trans_dir)
+        self.reader = MangaReader(target_dir, parent=None, raw_path=raw_dir, trans_path=trans_dir, chapter_title=f"{ch_str} - {orig_title}")
         self.reader.finished_reading.connect(lambda: self.on_reading_finished(cap_id))
         self.reader.show()
         
@@ -437,6 +509,28 @@ class DetailDialog(QDialog):
     def on_chapter_double_click(self, item):
         cap = item.data(Qt.UserRole)
         self.open_reader(cap)
+
+    def on_chapter_context_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if not item:
+            return
+        cap = item.data(Qt.UserRole)
+        if not cap:
+            return
+        source_site = cap[6]
+        if source_site != "local":
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        cap_id = cap[0]
+        act_del = menu.addAction("删除本地导入章节记录")
+        chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+        if chosen != act_del:
+            return
+        if QMessageBox.question(self, "确认", "确定删除该本地导入章节记录？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        db.delete_chapter(cap_id)
+        self.load_chapters()
 
     def on_reading_finished(self, cap_id):
         # 标绿，状态2
@@ -532,7 +626,9 @@ class DetailDialog(QDialog):
         full_path = os.path.join(base_dir, folder)
         
         for cap in chapters:
-            cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status = cap
+            # [Fix] 解包 10 个字段，匹配 db.get_chapters 返回的列数
+            # 字段顺序: id, chapter_str, title_original, url, is_downloaded, local_path, source_site, is_translated, read_status, chapter_num
+            cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status, chapter_num = cap
             
             safe_title = clean_filename(orig_title)
             level_1_dir = os.path.join(full_path, safe_title)
@@ -540,7 +636,7 @@ class DetailDialog(QDialog):
             
             actual_images = 0
             trans_images = 0
-            valid_exts = ('.png', '.jpg', '.jpeg', '.webp')
+            valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
             
             if not os.path.exists(level_1_dir):
                 is_dl = 0
@@ -583,13 +679,14 @@ class DetailDialog(QDialog):
             elif status_val == 2:
                 read_mark = " 🟢[已读]"
             
-            source_tag = f"[{source_site}]" if source_site else ""
+            source_tag = "" if source_site == "local" else (f"[{source_site}]" if source_site else "")
             text = f"{status_text} {ch_str} - {orig_title} {source_tag}{progress_text}{read_mark}"
             
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked) 
-            new_cap = (cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status)
+            # [Fix] 存入 item 的 UserRole 数据也需要更新为 10 元组，保持一致性
+            new_cap = (cap_id, ch_str, orig_title, url, is_dl, local_path, source_site, is_trans, read_status, chapter_num)
             item.setData(Qt.UserRole, new_cap)
             self.list_widget.addItem(item)
 
@@ -618,16 +715,47 @@ class DetailDialog(QDialog):
         if "nicomanga" in url: source = "nicomanga"
         elif "klmanga" in url: source = "klmanga"
         
-        self.log(f"开始更新章节 ({source})...")
-        self.workthread = WorkerThread("get_chapters", {"url": url, "source": source})
+        title_zh = ""
+        title_jp = ""
+        title_romaji = ""
+        try:
+            title_zh = self.manga_info["title_zh"] or ""
+        except Exception:
+            pass
+        try:
+            title_jp = self.manga_info["title_jp"] or ""
+        except Exception:
+            pass
+        try:
+            title_romaji = self.manga_info["title_romaji"] or ""
+        except Exception:
+            pass
+        title = title_zh or title_jp or title_romaji or ""
+        self.log(f"正在检查: {title} ({source})")
+        self.workthread = WorkerThread("get_chapters", {"url": url, "source": source, "title": title})
         self.workthread.finished_signal.connect(self.on_refresh_done)
         self.workthread.error_signal.connect(lambda e: self.log(f"错误：{e}"))
+        self.workthread.progress_signal.connect(lambda msg: self.log(msg))
         self.workthread.start()
 
     def on_refresh_done(self, result):
         if result['type'] == 'chapters':
             db.save_chapters(self.manga_id, result['data'], result['source'])
-            self.log(f"更新完成。")
+            latest_text = None
+            try:
+                rows = db.get_chapters(self.manga_id)
+                if rows:
+                    latest = rows[0]
+                    latest_text = latest[1]
+                    if latest[2] and latest[2] != latest[1]:
+                        latest_text = f"{latest[1]} - {latest[2]}"
+            except Exception:
+                latest_text = None
+
+            if latest_text:
+                self.log(f"检查完成，目前最新章节为 {latest_text}")
+            else:
+                self.log("检查完成，但未获取到最新章节信息")
             self.load_chapters()
 
     def run_translator(self):
@@ -649,16 +777,73 @@ class DetailDialog(QDialog):
                 
         self.execute_translation(tasks)
 
+    def eventFilter(self, source, event):
+        # 拦截 list_widget 的 KeyPress 事件
+        if source == self.list_widget and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Space:
+                items = self.list_widget.selectedItems()
+                if items:
+                    # 只要有一个是未勾选的，就全勾；全是已勾选的，才全不勾
+                    has_unchecked = any(i.checkState() == Qt.Unchecked for i in items)
+                    new_state = Qt.Checked if has_unchecked else Qt.Unchecked
+                    
+                    for item in items:
+                        item.setCheckState(new_state)
+                # 阻止事件继续传播，防止默认行为（只切换 focusItem）
+                return True
+        return super().eventFilter(source, event)
+
+    def on_selection_changed(self):
+        # 当用户使用鼠标框选或 Shift/Ctrl 多选时，自动同步 CheckBox 状态
+        # 策略：不自动修改 CheckBox，而是让“下载选中”/“翻译选中”按钮同时识别 Selection 和 CheckBox。
+        pass
+
+    def keyPressEvent(self, event):
+        # 监听空格键，切换当前选中项的 Check 状态
+        if event.key() == Qt.Key_Space:
+            # 必须使用 list_widget.selectedItems() 获取所有被框选的项目
+            # 注意：默认的 keyPressEvent 处理可能会被 QListWidget 内部的键盘导航抢占
+            # 所以如果焦点在 list_widget 上，可能需要安装事件过滤器或者在这里强制处理
+            items = self.list_widget.selectedItems()
+            if items:
+                # 统计当前状态，决定是全勾还是全不勾
+                # 只要有一个是未勾选的，就全勾；全是已勾选的，才全不勾
+                has_unchecked = any(i.checkState() == Qt.Unchecked for i in items)
+                new_state = Qt.Checked if has_unchecked else Qt.Unchecked
+                
+                for item in items:
+                    item.setCheckState(new_state)
+            
+            # 阻止默认的空格行为（防止只触发当前 focusItem 的切换）
+            event.accept()
+            return
+            
+        super().keyPressEvent(event)
+
     def translate_selected(self):
-        """点击 翻译选中：仅翻译打勾的项目"""
-        tasks =[]
+        """仅翻译打勾或框选的项目"""
+        # 合并 CheckBox 选中的和 HighLight 选中的
+        selected_items = self.list_widget.selectedItems()
+        checked_items = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.checkState() == Qt.Checked:
-                cap = item.data(Qt.UserRole)
-                # 必须是已下载才能翻译
-                if cap[4] == 1 and cap[7] == 0:
-                    tasks.append(cap)
+                checked_items.append(item)
+        
+        # 去重合并 (QListWidgetItem 不可哈希，改用 id 去重)
+        seen = set()
+        all_targets = []
+        for item in selected_items + checked_items:
+            if id(item) not in seen:
+                all_targets.append(item)
+                seen.add(id(item))
+
+        tasks = []
+        for item in all_targets:
+            cap = item.data(Qt.UserRole)
+            # 必须是已下载才能翻译
+            if cap[4] == 1:
+                tasks.append(cap)
         self.execute_translation(tasks)
 
     def execute_translation(self, tasks):
@@ -715,6 +900,111 @@ class DetailDialog(QDialog):
         path = os.path.join(base_dir, folder)
         os.makedirs(path, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def import_local_chapter(self):
+        base_dir = db.get_setting("base_dir")
+        folder = self.manga_info['folder_name'] or self.manga_info['title_romaji']
+        full_path = os.path.join(base_dir, folder)
+        os.makedirs(full_path, exist_ok=True)
+
+        chosen_dir = QFileDialog.getExistingDirectory(self, "选择要导入的图片目录", full_path)
+        if not chosen_dir:
+            return
+
+        valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
+        images = []
+        chosen_dir_abs = os.path.abspath(chosen_dir)
+        for root, _, files in os.walk(chosen_dir_abs):
+            for f in files:
+                full = os.path.join(root, f)
+                if f.lower().endswith(valid_exts):
+                    images.append(full)
+
+        if not images:
+            QMessageBox.information(self, "提示", "该目录下没有找到图片文件。")
+            return
+
+        def sort_key(p):
+            rel = os.path.relpath(p, chosen_dir_abs)
+            parts = re.split(r'(\d+)', rel)
+            out = []
+            for t in parts:
+                if t.isdigit():
+                    out.append(int(t))
+                else:
+                    out.append(t.lower())
+            return out
+
+        images.sort(key=sort_key)
+
+        base_name = os.path.basename(os.path.normpath(chosen_dir_abs)) or "Imported"
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        title_original = f"{base_name} {stamp} [local]"
+        chapter_str = f"Local {stamp}"
+
+        safe_title = clean_filename(title_original)
+        level_1_dir = os.path.join(full_path, safe_title)
+        raw_dir = os.path.join(level_1_dir, safe_title)
+        os.makedirs(raw_dir, exist_ok=True)
+
+        for idx, src in enumerate(images):
+            ext = os.path.splitext(src)[1].lower()
+            dst_name = f"{idx + 1:04d}{ext}"
+            dst = os.path.join(raw_dir, dst_name)
+            shutil.copy2(src, dst)
+
+        cap_id = db.add_local_chapter(
+            self.manga_id,
+            chapter_str=chapter_str,
+            title_original=title_original,
+            local_path=os.path.abspath(raw_dir),
+            source_site="local",
+        )
+
+        self.load_chapters()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            cap = item.data(Qt.UserRole)
+            if cap and cap[0] == cap_id:
+                item.setCheckState(Qt.Checked)
+                break
+
+        self.log(f"✅ 已导入本地章节: {title_original} ({len(images)} 页)")
+
+    def open_glossary_editor(self):
+        """打开术语表编辑器"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("编辑术语表")
+        dlg.resize(400, 300)
+        layout = QVBoxLayout(dlg)
+        
+        layout.addWidget(QLabel("请填写专有名词（只有中文），每行一个："))
+        
+        editor = QTextEdit()
+        # 获取现有术语
+        # self.manga_info 是一个 Row 对象，可以通过列名或索引访问
+        # 由于我们刚刚添加了 glossary 列，需要重新获取最新的 manga_info
+        self.manga_info = db.get_manga_detail(self.manga_id)
+        current_glossary = ""
+        # 兼容处理：检查是否存在 glossary 字段
+        if 'glossary' in self.manga_info.keys():
+            current_glossary = self.manga_info['glossary'] or ""
+        
+        editor.setPlainText(current_glossary)
+        layout.addWidget(editor)
+        
+        btn_save = QPushButton("保存")
+        def save():
+            text = editor.toPlainText().strip()
+            db.update_manga_glossary(self.manga_id, text)
+            self.manga_info = db.get_manga_detail(self.manga_id) # 刷新缓存
+            self.log("术语表已更新")
+            dlg.accept()
+            
+        btn_save.clicked.connect(save)
+        layout.addWidget(btn_save)
+        
+        dlg.exec()
 
     def delete_manga_confirm(self):
         msg_box = QMessageBox(self)
@@ -780,13 +1070,29 @@ class DetailDialog(QDialog):
             self._core_task_token = None
 
     def download_selected(self):
-        tasks = []
+        """下载打勾或框选的项目"""
+        # 合并 CheckBox 选中的和 HighLight 选中的
+        selected_items = self.list_widget.selectedItems()
+        checked_items = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.checkState() == Qt.Checked:
-                cap = item.data(Qt.UserRole)
-                if cap[4] == 0:
-                    tasks.append(cap)
+                checked_items.append(item)
+        
+        # 去重合并 (QListWidgetItem 不可哈希，改用 id 去重)
+        seen = set()
+        all_targets = []
+        for item in selected_items + checked_items:
+            if id(item) not in seen:
+                all_targets.append(item)
+                seen.add(id(item))
+        
+        tasks = []
+        for item in all_targets:
+            cap = item.data(Qt.UserRole)
+            # cap[4] 是 is_dl
+            if cap[4] == 0:
+                tasks.append(cap)
         self.execute_download(tasks)
 
     def download_pending(self):
@@ -882,11 +1188,16 @@ class DetailDialog(QDialog):
         base_dir = db.get_setting("base_dir")
         folder = self.manga_info['folder_name'] or self.manga_info['title_romaji']
         full_path = os.path.join(base_dir, folder)
+
+        self.manga_info = db.get_manga_detail(self.manga_id)
+        glossary = ""
+        if 'glossary' in self.manga_info.keys():
+            glossary = self.manga_info['glossary'] or ""
         
         worker_tasks =[]
         for cap in tasks:
             safe_title = clean_filename(cap[2])
-            worker_tasks.append({"cap_id": cap[0], "base_dir": full_path, "ch_title": safe_title})
+            worker_tasks.append({"cap_id": cap[0], "base_dir": full_path, "ch_title": safe_title, "glossary": glossary})
             
         self.log(f"开始翻译任务，共计 {len(worker_tasks)} 个章节。")
         self.btn_cancel_trans.setEnabled(True)

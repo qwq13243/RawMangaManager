@@ -247,7 +247,7 @@ class NicoMangaScraper(BaseScraper):
             page.wait_for_selector('.chapter-grid-container', timeout=30000)
             
             # 【修正2】: 先稍微等待让展开按钮真正被加载进DOM
-            time.sleep(2)
+            time.sleep(0.5)
             show_all_btn = page.locator('.show-all-chapters-btn')
             
             # 【修正3】: 更稳定的按钮检测与点击，避免 is_visible 瞬发失效
@@ -255,7 +255,7 @@ class NicoMangaScraper(BaseScraper):
                 try:
                     show_all_btn.wait_for(state="visible", timeout=3000)
                     show_all_btn.click()
-                    time.sleep(2)  # 点击后给予展开所有DOM的时间
+                    time.sleep(0.5)  # 点击后给予展开所有DOM的时间
                 except:
                     pass
             chapter_elements = page.locator('a.chapter-grid-item').all()
@@ -279,18 +279,35 @@ class NicoMangaScraper(BaseScraper):
         
         try:
             if progress_callback: progress_callback(10, 100, f"打开章节界面...")
-            page.goto(chapter_url, timeout=60000)
+            page.goto(chapter_url, timeout=60000, wait_until="domcontentloaded")
             
-            # 处理 R-18 弹窗
-            try:
-                page.locator('#age_warning_modal').wait_for(state="visible", timeout=4000)
+            # 快速检查 R-18 弹窗 (非阻塞)
+            if page.locator('#age_warning_modal').is_visible():
                 page.reload(timeout=60000)
-                time.sleep(2)
+            
+            # 尝试暴力移除常见的广告遮挡层 (高 z-index 元素)
+            try:
+                page.evaluate("""
+                    () => {
+                        document.querySelectorAll('div, iframe').forEach(el => {
+                            const style = window.getComputedStyle(el);
+                            if (['fixed', 'absolute'].includes(style.position) && parseInt(style.zIndex) > 999) {
+                                // 排除可能是正常 UI 的元素 (根据需要调整)
+                                if (!el.classList.contains('header') && !el.id.includes('menu')) {
+                                    el.remove();
+                                }
+                            }
+                        });
+                    }
+                """)
             except: pass
 
-            page.locator('#download_chapter_btn').wait_for(state="visible", timeout=30000)
+            dl_btn = page.locator('#download_chapter_btn')
+            dl_btn.wait_for(state="visible", timeout=30000)
+            
+            # 使用 force=True 强制点击，无视可能残留的透明遮挡
             with context.expect_page() as new_page_info:
-                page.locator('#download_chapter_btn').click()
+                dl_btn.click(force=True)
             dl_page = new_page_info.value
             
             if progress_callback: progress_callback(30, 100, "等待获取下载权限(倒计时)...")

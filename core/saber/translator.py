@@ -152,7 +152,8 @@ def translate_batch_text(text_list, target_language, model_provider,
                           api_key=None, model_name=None, prompt_content=None, 
                           use_json_format=False, custom_base_url=None,
                           rpm_limit_translation: int = constants.DEFAULT_rpm_TRANSLATION,
-                          max_retries: int = constants.DEFAULT_TRANSLATION_MAX_RETRIES):
+                          max_retries: int = constants.DEFAULT_TRANSLATION_MAX_RETRIES,
+                          glossary: str = ""):
     """
     批量翻译文本列表。
     """
@@ -186,7 +187,16 @@ def translate_batch_text(text_list, target_language, model_provider,
     
     # 构造一个新的 prompt_content (system prompt) 来强调格式
     system_prompt = prompt_content or constants.DEFAULT_PROMPT
+    
+    # 动态注入术语表
+    if glossary and glossary.strip():
+        system_prompt += f"\n\n以下是本漫画的专用术语表（只有中文）：\n{glossary.strip()}\n请在翻译时自行判断日文原文与这些中文术语的对应关系，并强制使用术语表中的中文进行翻译。"
+    
     system_prompt += "\n重要：请严格按照 <|n|> 格式返回，不要包含其他解释性文字。"
+
+    if os.environ.get("MANGA_PROMPT_DEBUG", "0") == "1":
+        logger.info("=== SYSTEM PROMPT BEGIN ===\n" + system_prompt + "\n=== SYSTEM PROMPT END ===")
+        logger.info("=== USER PROMPT BEGIN ===\n" + batch_prompt + "\n=== USER PROMPT END ===")
     
     # 临时调用 translate_single_text，但我们需要它返回 raw content 而不是 JSON extracted
     # 实际上 translate_single_text 内部如果不传 use_json_format=True 就返回 raw

@@ -3,7 +3,7 @@ import re
 from PySide6.QtCore import QThread, Signal
 from core.database import db
 from core.scrapers_registry import SCRAPERS
-from core.utils import split_image_in_place
+from core.utils import split_image_in_place, find_playwright_executable
 from scrapers import clean_filename, RawkumaScraper
 
 class WorkerThread(QThread):
@@ -32,7 +32,9 @@ class WorkerThread(QThread):
                 addr = db.get_setting('proxy_addr')
                 if addr: proxy = {"server": addr}
             
-            self.p_browser = self.p_playwright.chromium.launch(headless=headless, proxy=proxy)
+            # [Fix] Use existing browser if available
+            exe_path = find_playwright_executable()
+            self.p_browser = self.p_playwright.chromium.launch(headless=headless, proxy=proxy, executable_path=exe_path)
             context = self.p_browser.new_context(accept_downloads=True)
             page = context.new_page()
 
@@ -115,7 +117,15 @@ class WorkerThread(QThread):
                         base_dir = self.kwargs["base_dir"]
                         prefix = ""
 
-                    cap_id, ch_str, orig_title, chapter_url, is_dl, local_path, source_site, is_trans, read_status = cap
+                    cap_id = cap[0]
+                    ch_str = cap[1]
+                    orig_title = cap[2]
+                    chapter_url = cap[3]
+                    is_dl = cap[4]
+                    local_path = cap[5]
+                    source_site = cap[6]
+                    is_trans = cap[7]
+                    read_status = cap[8]
                     
                     cap_record = db.get_chapter_by_id(cap_id)
                     dl_url = cap_record['dl_url'] if cap_record else ""
@@ -158,6 +168,22 @@ class WorkerThread(QThread):
                         self.progress_signal.emit(f"[成功] {ch_str} 保存至: {saved_path}")
 
                 self.finished_signal.emit({"type": "done"})
+            
+            elif self.task_type == "get_chapters":
+                source_key = self.kwargs.get("source", "rawkuma")
+                url = self.kwargs.get("url", "")
+                title = self.kwargs.get("title", "")
+                if title:
+                    self.progress_signal.emit(f"正在检查: {title}")
+                scraper = SCRAPERS.get(source_key)
+                if not scraper:
+                    self.error_signal.emit(f"未知的源: {source_key}")
+                    return
+                if not url:
+                    self.error_signal.emit("缺少漫画链接，无法更新章节")
+                    return
+                chs = scraper.get_chapters(page, url)
+                self.finished_signal.emit({"type": "chapters", "data": chs, "source": source_key})
 
             self.p_browser.close()
         except Exception as e:
@@ -196,7 +222,9 @@ class BatchUpdateWorker(QThread):
                 addr = db.get_setting('proxy_addr')
                 if addr: proxy = {"server": addr}
             
-            self.p_browser = self.p_playwright.chromium.launch(headless=headless, proxy=proxy)
+            # [Fix] Use existing browser if available
+            exe_path = find_playwright_executable()
+            self.p_browser = self.p_playwright.chromium.launch(headless=headless, proxy=proxy, executable_path=exe_path)
             storage_state = "google_cookie.json" if os.path.exists("google_cookie.json") else None
             context = self.p_browser.new_context(accept_downloads=True, storage_state=storage_state)
             page = context.new_page()
@@ -228,6 +256,21 @@ class BatchUpdateWorker(QThread):
                         chs = scraper.get_chapters(page, url)
                         if chs:
                             db.save_chapters(m_id, chs, source)
+                            latest_text = None
+                            try:
+                                rows = db.get_chapters(m_id)
+                                if rows:
+                                    latest = rows[0]
+                                    latest_text = latest[1]
+                                    if latest[2] and latest[2] != latest[1]:
+                                        latest_text = f"{latest[1]} - {latest[2]}"
+                            except Exception:
+                                latest_text = None
+
+                            if latest_text:
+                                self.progress_signal.emit(f"检查完成: {title}，目前最新章节为 {latest_text}")
+                            else:
+                                self.progress_signal.emit(f"检查完成: {title}，但未获取到最新章节信息")
                             # 逐本完成即刻发送更新信号
                             self.refresh_signal.emit()
                     except:

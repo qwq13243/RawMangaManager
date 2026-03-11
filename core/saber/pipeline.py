@@ -25,7 +25,8 @@ class SaberPipeline:
                       detector_key='default',
                       translator_key=None, # e.g. 'siliconflow'
                       api_key=None,
-                      model_name=None):
+                      model_name=None,
+                      glossary=""):
         
         logger.info(f"Processing image: {image_path}")
         
@@ -118,7 +119,8 @@ class SaberPipeline:
                     model_name=model_name,
                     custom_base_url=config.base_url,
                     rpm_limit_translation=config.rpm_limit,
-                    max_retries=config.max_retries
+                    max_retries=config.max_retries,
+                    glossary=glossary
                 )
                 
                 # Assign back to blocks

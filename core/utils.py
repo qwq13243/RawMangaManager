@@ -1,5 +1,39 @@
 import os
+import glob
+import sys
 from PySide6.QtGui import QColor, QImage, QPainter
+
+def find_playwright_executable():
+    """查找本地ms-playwright中的chromium可执行文件"""
+    # 优先检查环境变量
+    browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_path or not os.path.isdir(browsers_path):
+        return None
+
+    # 查找 chromium-* 目录
+    # 注意：Playwright 版本更新可能导致目录名变更，需模糊匹配
+    # 优先找 chromium-1208 (如果有的话)，否则找任何 chromium-*
+    candidates = glob.glob(os.path.join(browsers_path, "chromium-*"))
+    if not candidates:
+        return None
+        
+    # 按名称倒序排列（通常版本号越高越好？）
+    # chromium-1208 vs chromium-1140
+    candidates.sort(reverse=True)
+    
+    for folder in candidates:
+        # 检查常见路径
+        # win: chrome-win/chrome.exe or chrome-win64/chrome.exe
+        exe_paths = [
+            os.path.join(folder, "chrome-win", "chrome.exe"),
+            os.path.join(folder, "chrome-win64", "chrome.exe"),
+        ]
+        
+        for p in exe_paths:
+            if os.path.exists(p):
+                return p
+                
+    return None
 
 def split_image_in_place(image_path):
     """就地分割长图并删除原图，按宽度×(1600/1115)计算目标高度比例，确保高度能被整除"""

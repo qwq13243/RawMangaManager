@@ -3,9 +3,9 @@ import re
 import os
 import glob
 import json
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication, QComboBox, QHBoxLayout, QLabel, QSpacerItem, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication, QComboBox, QHBoxLayout, QLabel, QSpacerItem, QSizePolicy, QPushButton
 from PySide6.QtGui import QPixmap, Qt, QWheelEvent, QMouseEvent, QKeyEvent, QPainter
-from PySide6.QtCore import Signal, QPoint, QTimer
+from PySide6.QtCore import Signal, QPoint, QTimer, QEvent, QRectF
 
 from core.database import db
 
@@ -47,7 +47,7 @@ class ReaderView(QGraphicsView):
 class MangaReader(QWidget):
     finished_reading = Signal()
 
-    def __init__(self, images_or_dir, parent=None, raw_path=None, trans_path=None):
+    def __init__(self, images_or_dir, parent=None, raw_path=None, trans_path=None, chapter_title=None):
         super().__init__(parent)
         self.setWindowFlag(Qt.Window) # 确保作为独立窗口浮动
 
@@ -59,6 +59,7 @@ class MangaReader(QWidget):
         # 初始化路径
         self.raw_path = raw_path
         self.trans_path = trans_path
+        self.chapter_title = chapter_title or ""
         
         # 确定当前模式和图片列表
         if isinstance(images_or_dir, list):
@@ -77,8 +78,9 @@ class MangaReader(QWidget):
                 self.current_mode = "raw"
                 
         self.current_index = 0
-        
-        self.setWindowTitle("内置阅读器")
+        self.merge_mode = None
+        self.merge_gap = 0
+        self._update_window_title()
         
         # UI 初始化
         layout = QVBoxLayout(self)
@@ -95,12 +97,27 @@ class MangaReader(QWidget):
         self.combo_page = QComboBox()
         self.combo_page.setFocusPolicy(Qt.NoFocus) # 防止抢占键盘焦点
         self.combo_page.currentIndexChanged.connect(self.on_page_selected)
+
+        self.btn_merge_prev = QPushButton("与上一页拼页")
+        self.btn_merge_prev.setFocusPolicy(Qt.NoFocus)
+        self.btn_merge_prev.clicked.connect(self.merge_with_prev)
+
+        self.btn_merge_next = QPushButton("与下一页拼页")
+        self.btn_merge_next.setFocusPolicy(Qt.NoFocus)
+        self.btn_merge_next.clicked.connect(self.merge_with_next)
+
+        self.btn_merge_cancel = QPushButton("取消拼页")
+        self.btn_merge_cancel.setFocusPolicy(Qt.NoFocus)
+        self.btn_merge_cancel.clicked.connect(self.cancel_merge)
         
         self.lbl_mode = QLabel(f"当前: {'熟肉' if self.current_mode == 'trans' else '生肉'}")
         self.lbl_mode.setStyleSheet("font-weight: bold; color: #333;")
         
         top_layout.addWidget(self.lbl_page)
         top_layout.addWidget(self.combo_page)
+        top_layout.addWidget(self.btn_merge_prev)
+        top_layout.addWidget(self.btn_merge_next)
+        top_layout.addWidget(self.btn_merge_cancel)
         top_layout.addStretch()
         top_layout.addWidget(self.lbl_mode)
         
@@ -111,19 +128,46 @@ class MangaReader(QWidget):
         self.view.click_left.connect(self.next_page)
         self.view.click_right.connect(self.prev_page)
         self.view.click_middle.connect(self.toggle_mode) # [新增] 中键切换
+        self.view.installEventFilter(self)
         
         layout.addWidget(self.view)
         
-        self.pixmap_item = QGraphicsPixmapItem()
-        # 图元本身设置平滑转换，避免低分辨率模糊
-        self.pixmap_item.setTransformationMode(Qt.SmoothTransformation)
-        self.scene.addItem(self.pixmap_item)
+        self.pixmap_item_left = QGraphicsPixmapItem()
+        self.pixmap_item_left.setTransformationMode(Qt.SmoothTransformation)
+        self.scene.addItem(self.pixmap_item_left)
+
+        self.pixmap_item_right = QGraphicsPixmapItem()
+        self.pixmap_item_right.setTransformationMode(Qt.SmoothTransformation)
+        self.pixmap_item_right.setVisible(False)
+        self.scene.addItem(self.pixmap_item_right)
         
         self._restore_window_state()
 
         # 初始化下拉框
         self.update_page_combo()
         self.load_image()
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.KeyPress:
+            self.keyPressEvent(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _update_window_title(self):
+        total = len(self.images)
+        page_part = f"{self.current_index + 1} / {total}" if total else "-"
+        mode_part = "熟肉" if self.current_mode == "trans" else "生肉"
+        if self.chapter_title:
+            title = f"{self.chapter_title} - {page_part} ({mode_part})"
+        else:
+            title = f"{page_part} ({mode_part})"
+        self.setWindowTitle(title)
+
+    def _current_content_rect(self) -> QRectF:
+        rect = self.pixmap_item_left.sceneBoundingRect()
+        if self.pixmap_item_right.isVisible():
+            rect = rect.united(self.pixmap_item_right.sceneBoundingRect())
+        return rect
 
     def _restore_window_state(self):
         raw = db.get_setting("reader_window_geometry", "")
@@ -164,16 +208,22 @@ class MangaReader(QWidget):
     def _load_images_from_dir(self, directory):
         if not directory or not os.path.exists(directory):
             return []
-        valid_exts = ('*.png', '*.jpg', '*.jpeg', '*.webp')
+        valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
         images = []
-        for ext in valid_exts:
-            # 如果是生肉目录，需要排除 Trans_ 子目录下的文件（如果存在）
-            files = glob.glob(os.path.join(directory, ext))
+        try:
+            # 避免使用 glob.glob，改用 os.listdir
+            files = os.listdir(directory)
             for f in files:
-                if "Trans_" not in os.path.basename(f) and "Trans_" not in f.replace(directory, ""):
-                    images.append(f)
-                elif "Trans_" in directory: # 如果本身就是翻译目录，则保留
-                    images.append(f)
+                full = os.path.join(directory, f)
+                if os.path.isfile(full):
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in valid_exts:
+                        if "Trans_" not in os.path.basename(f) and "Trans_" not in f.replace(directory, ""):
+                            images.append(full)
+                        elif "Trans_" in directory: # 如果本身就是翻译目录，则保留
+                            images.append(full)
+        except Exception as e:
+            print(f"Error loading images: {e}")
         return sorted(images, key=natural_sort_key)
 
     def update_page_combo(self):
@@ -222,12 +272,55 @@ class MangaReader(QWidget):
         self.update_page_combo()
         self.load_image()
 
+    def merge_with_prev(self):
+        if len(self.images) <= 1:
+            self.merge_mode = None
+            return
+        if self.current_index == 0:
+            self.merge_mode = "spread"
+            self.load_image()
+            return
+        self.current_index = max(0, self.current_index - 1)
+        self.merge_mode = "spread"
+        self.load_image()
+
+    def merge_with_next(self):
+        if len(self.images) <= 1:
+            self.merge_mode = None
+            return
+        if self.current_index >= len(self.images) - 1:
+            self.current_index = max(0, len(self.images) - 2)
+        self.merge_mode = "spread"
+        self.load_image()
+
+    def cancel_merge(self):
+        self.merge_mode = None
+        self.load_image()
+
     def load_image(self):
         if 0 <= self.current_index < len(self.images):
             pixmap = QPixmap(self.images[self.current_index])
-            self.pixmap_item.setPixmap(pixmap)
-            self.scene.setSceneRect(self.pixmap_item.boundingRect())
-            self.setWindowTitle(f"阅读器 - 第 {self.current_index + 1} / {len(self.images)} 页 ({'熟肉' if self.current_mode == 'trans' else '生肉'})")
+            self.pixmap_item_left.setPixmap(pixmap)
+            self.pixmap_item_left.setPos(0, 0)
+
+            other_index = None
+            if self.merge_mode == "spread" and self.current_index < len(self.images) - 1:
+                other_index = self.current_index + 1
+
+            if other_index is not None:
+                other_pixmap = QPixmap(self.images[other_index])
+                self.pixmap_item_right.setPixmap(other_pixmap)
+                self.pixmap_item_right.setPos(pixmap.width() + self.merge_gap, 0)
+                self.pixmap_item_right.setVisible(True)
+            else:
+                self.pixmap_item_right.setPixmap(QPixmap())
+                self.pixmap_item_right.setPos(0, 0)
+                self.pixmap_item_right.setVisible(False)
+
+            rect = self._current_content_rect()
+            if rect.isValid():
+                self.scene.setSceneRect(rect)
+            self._update_window_title()
             
             # 同步下拉框状态（防止翻页后下拉框不同步）
             self.combo_page.blockSignals(True)
@@ -235,9 +328,9 @@ class MangaReader(QWidget):
             self.combo_page.blockSignals(False)
             
             screen = QApplication.primaryScreen().availableGeometry()
-            # [修改] 考虑顶部工具栏的高度
-            target_w = min(pixmap.width() + 40, screen.width() - 100)
-            target_h = min(pixmap.height() + 80, screen.height() - 100)
+            rect = self.scene.sceneRect()
+            target_w = min(int(rect.width()) + 40, screen.width() - 100)
+            target_h = min(int(rect.height()) + 80, screen.height() - 100)
             
             # 只有当窗口明显过小的时候才去 resize，避免每次翻页都抖动
             if not self._window_state_restored and (self.width() < 200 or self.height() < 200):
@@ -247,9 +340,9 @@ class MangaReader(QWidget):
             QTimer.singleShot(10, self.fit_image)
 
     def fit_image(self):
-        # 封装的缩放方法
-        if self.pixmap_item.pixmap() and not self.pixmap_item.pixmap().isNull():
-            self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+        rect = self._current_content_rect()
+        if rect.isValid():
+            self.view.fitInView(rect, Qt.KeepAspectRatio)
 
     def resizeEvent(self, event):
         # 当窗口被用户拉伸或初始展示时，自动贴合尺寸
@@ -268,14 +361,32 @@ class MangaReader(QWidget):
             super().closeEvent(event)
 
     def next_page(self):
+        if self.merge_mode == "spread":
+            if self.current_index >= len(self.images) - 2:
+                self.finished_reading.emit()
+                self.close()
+                return
+            self.current_index += 2
+            self.load_image()
+            return
+
         if self.current_index < len(self.images) - 1:
             self.current_index += 1
             self.load_image()
-        else:
-            self.finished_reading.emit()
-            self.close()
+            return
+
+        self.finished_reading.emit()
+        self.close()
 
     def prev_page(self):
+        if self.merge_mode == "spread":
+            if self.current_index >= 2:
+                self.current_index -= 2
+            else:
+                self.current_index = 0
+            self.load_image()
+            return
+
         if self.current_index > 0:
             self.current_index -= 1
             self.load_image()
@@ -287,5 +398,11 @@ class MangaReader(QWidget):
             self.prev_page()
         elif event.key() == Qt.Key_Space: # [新增] 空格键切换模式
             self.toggle_mode()
+        elif event.key() == Qt.Key_1:
+            self.merge_with_prev()
+        elif event.key() == Qt.Key_2:
+            self.merge_with_next()
+        elif event.key() == Qt.Key_3:
+            self.cancel_merge()
         else:
             super().keyPressEvent(event)

@@ -49,7 +49,13 @@ class DBHelper:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass 
-        
+
+        try:
+            self.conn.cursor().execute("ALTER TABLE manga ADD COLUMN glossary TEXT DEFAULT ''")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         defaults = {
             'base_dir': os.path.join(QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation), "MangaDownloads"),
             'translator_path': '',
@@ -77,11 +83,39 @@ class DBHelper:
         for k, v in defaults.items():
             cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         self.conn.commit()
+        
+    def update_manga_glossary(self, manga_id, glossary):
+        with self.lock:
+            self.conn.cursor().execute("UPDATE manga SET glossary=? WHERE id=?", (glossary, manga_id))
+            self.conn.commit()
 
     def get_chapter_by_id(self, chapter_id):
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM chapters WHERE id=?", (chapter_id,))
         return cursor.fetchone()
+
+    def add_local_chapter(self, manga_id, chapter_str, title_original, local_path, source_site="local"):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*), COALESCE(MIN(chapter_num), 0) FROM chapters WHERE manga_id=?", (manga_id,))
+            row = cursor.fetchone()
+            count = int(row[0] or 0)
+            min_num = float(row[1] or 0)
+            chapter_num = 1.0 if count == 0 else (min_num - 0.001)
+
+            cursor.execute(
+                """INSERT INTO chapters
+                   (manga_id, chapter_num, chapter_str, title_original, url, dl_url, source_site, is_downloaded, local_path)
+                   VALUES (?, ?, ?, ?, '', '', ?, 1, ?)""",
+                (manga_id, chapter_num, chapter_str, title_original, source_site, local_path),
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    def delete_chapter(self, chapter_id):
+        with self.lock:
+            self.conn.cursor().execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+            self.conn.commit()
 
     def get_setting(self, key, default=""):
         cursor = self.conn.cursor()
@@ -116,13 +150,16 @@ class DBHelper:
         # 将查询字段补充完整并按 中文、日文、罗马音 顺序提取
         # 注意：这里我们增加了 is_following 和 sort_order 字段，确保顺序正确
         try:
-            cursor.execute("SELECT id, title_zh, title_jp, title_romaji, cover_path, is_following, sort_order FROM manga ORDER BY sort_order ASC, id DESC")
+            cursor.execute("SELECT id, title_zh, title_jp, title_romaji, cover_path, is_following, sort_order, glossary FROM manga ORDER BY sort_order ASC, id DESC")
         except sqlite3.OperationalError:
-            # 如果旧版代码未迁移导致列不存在，回退
-            cursor.execute("SELECT id, title_zh, title_jp, title_romaji, cover_path FROM manga ORDER BY id DESC")
-            # 补齐默认值
+            try:
+                cursor.execute("SELECT id, title_zh, title_jp, title_romaji, cover_path, is_following, sort_order FROM manga ORDER BY sort_order ASC, id DESC")
+            except sqlite3.OperationalError:
+                cursor.execute("SELECT id, title_zh, title_jp, title_romaji, cover_path FROM manga ORDER BY id DESC")
+                res = cursor.fetchall()
+                return [(r[0], r[1], r[2], r[3], r[4], 1, 0, "") for r in res]
             res = cursor.fetchall()
-            return [(r[0], r[1], r[2], r[3], r[4], 1, 0) for r in res]
+            return [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], "") for r in res]
         return cursor.fetchall()
 
     def update_manga_following(self, manga_id, is_following):
@@ -199,7 +236,8 @@ class DBHelper:
 
     def get_chapters(self, manga_id):
         cursor = self.conn.cursor()
-        cursor.execute("""SELECT id, chapter_str, title_original, url, is_downloaded, local_path, source_site, is_translated, read_status 
+        # 增加返回 chapter_num 字段 (index 9)
+        cursor.execute("""SELECT id, chapter_str, title_original, url, is_downloaded, local_path, source_site, is_translated, read_status, chapter_num 
                           FROM chapters WHERE manga_id=? ORDER BY chapter_num DESC""", (manga_id,))
         return cursor.fetchall()
 
