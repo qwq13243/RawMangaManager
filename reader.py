@@ -80,6 +80,7 @@ class MangaReader(QWidget):
         self.current_index = 0
         self.merge_mode = None
         self.merge_gap = 0
+        self.merge_offset = 1
         self._update_window_title()
         
         # UI 初始化
@@ -164,9 +165,12 @@ class MangaReader(QWidget):
         self.setWindowTitle(title)
 
     def _current_content_rect(self) -> QRectF:
-        rect = self.pixmap_item_left.sceneBoundingRect()
-        if self.pixmap_item_right.isVisible():
-            rect = rect.united(self.pixmap_item_right.sceneBoundingRect())
+        rect = QRectF()
+        if self.pixmap_item_left.isVisible() and not self.pixmap_item_left.pixmap().isNull():
+            rect = self.pixmap_item_left.sceneBoundingRect()
+        if self.pixmap_item_right.isVisible() and not self.pixmap_item_right.pixmap().isNull():
+            right_rect = self.pixmap_item_right.sceneBoundingRect()
+            rect = rect.united(right_rect) if rect.isValid() else right_rect
         return rect
 
     def _restore_window_state(self):
@@ -276,43 +280,51 @@ class MangaReader(QWidget):
         if len(self.images) <= 1:
             self.merge_mode = None
             return
-        if self.current_index == 0:
-            self.merge_mode = "spread"
-            self.load_image()
-            return
-        self.current_index = max(0, self.current_index - 1)
         self.merge_mode = "spread"
+        self.merge_offset = -1
         self.load_image()
 
     def merge_with_next(self):
         if len(self.images) <= 1:
             self.merge_mode = None
             return
-        if self.current_index >= len(self.images) - 1:
-            self.current_index = max(0, len(self.images) - 2)
         self.merge_mode = "spread"
+        self.merge_offset = 1
         self.load_image()
 
     def cancel_merge(self):
         self.merge_mode = None
+        self.merge_offset = 1
         self.load_image()
 
     def load_image(self):
         if 0 <= self.current_index < len(self.images):
             pixmap = QPixmap(self.images[self.current_index])
-            self.pixmap_item_left.setPixmap(pixmap)
-            self.pixmap_item_left.setPos(0, 0)
 
-            other_index = None
-            if self.merge_mode == "spread" and self.current_index < len(self.images) - 1:
-                other_index = self.current_index + 1
+            if self.merge_mode == "spread":
+                other_index = self.current_index + self.merge_offset
+                if 0 <= other_index < len(self.images):
+                    other_pixmap = QPixmap(self.images[other_index])
+                    self.pixmap_item_left.setPixmap(other_pixmap)
+                    self.pixmap_item_left.setPos(0, 0)
+                    self.pixmap_item_left.setVisible(True)
 
-            if other_index is not None:
-                other_pixmap = QPixmap(self.images[other_index])
-                self.pixmap_item_right.setPixmap(other_pixmap)
-                self.pixmap_item_right.setPos(pixmap.width() + self.merge_gap, 0)
-                self.pixmap_item_right.setVisible(True)
+                    self.pixmap_item_right.setPixmap(pixmap)
+                    self.pixmap_item_right.setPos(other_pixmap.width() + self.merge_gap, 0)
+                    self.pixmap_item_right.setVisible(True)
+                else:
+                    self.pixmap_item_left.setPixmap(QPixmap())
+                    self.pixmap_item_left.setPos(0, 0)
+                    self.pixmap_item_left.setVisible(False)
+
+                    self.pixmap_item_right.setPixmap(pixmap)
+                    self.pixmap_item_right.setPos(0, 0)
+                    self.pixmap_item_right.setVisible(True)
             else:
+                self.pixmap_item_left.setPixmap(pixmap)
+                self.pixmap_item_left.setPos(0, 0)
+                self.pixmap_item_left.setVisible(True)
+
                 self.pixmap_item_right.setPixmap(QPixmap())
                 self.pixmap_item_right.setPos(0, 0)
                 self.pixmap_item_right.setVisible(False)
@@ -362,7 +374,7 @@ class MangaReader(QWidget):
 
     def next_page(self):
         if self.merge_mode == "spread":
-            if self.current_index >= len(self.images) - 2:
+            if self.current_index + 2 >= len(self.images):
                 self.finished_reading.emit()
                 self.close()
                 return
@@ -380,10 +392,7 @@ class MangaReader(QWidget):
 
     def prev_page(self):
         if self.merge_mode == "spread":
-            if self.current_index >= 2:
-                self.current_index -= 2
-            else:
-                self.current_index = 0
+            self.current_index = max(0, self.current_index - 2)
             self.load_image()
             return
 
