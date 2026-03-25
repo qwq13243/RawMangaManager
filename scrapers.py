@@ -47,8 +47,14 @@ class BaseScraper:
 class KlMangaScraper(BaseScraper):
     source_name = "KlManga"
     
+    def _fix_url(self, url):
+        """将所有旧的 klmanga 域名统一替换为最新可用的 klmanga.voto"""
+        if url:
+            return re.sub(r'https?://(?:www\.)?klmanga\.[a-z]+', 'https://klmanga.voto', url)
+        return url
+    
     def search(self, page, keyword):
-        page.goto(f"https://klmanga.talk/?s={keyword}")
+        page.goto(f"https://klmanga.voto/?s={keyword}")
         page.wait_for_timeout(2000)
         results = page.locator('a.thumb.d-block.mb-3').all()
         mangas = []
@@ -66,6 +72,7 @@ class KlMangaScraper(BaseScraper):
         return mangas
 
     def get_chapters(self, page, manga_url):
+            manga_url = self._fix_url(manga_url)
             # 【修正1】: 增加 wait_until="domcontentloaded"，并在选定元素后加入硬等待
             page.goto(manga_url, wait_until="domcontentloaded")
             page.wait_for_selector('.chapter-box', timeout=10000)
@@ -107,6 +114,7 @@ class KlMangaScraper(BaseScraper):
             return False
 
     def download_chapter(self, context, manga_save_path, chapter_title, chapter_url, progress_callback=None, cancel_check=None, dl_url=None):
+        chapter_url = self._fix_url(chapter_url)
         page = context.new_page()
         user_agent = page.evaluate("navigator.userAgent")
         chapter_dir_name = clean_filename(chapter_title)
@@ -116,82 +124,170 @@ class KlMangaScraper(BaseScraper):
         
         try:
             if progress_callback: progress_callback(0, 100, f"正在加载页面: {chapter_title}")
-            page.goto(chapter_url)
+            page.goto(chapter_url, timeout=60000, wait_until="domcontentloaded")
             
             try:
                 page.locator('.color-btn.go-open-popup').click(timeout=5000)
             except:
                 pass
 
-            if progress_callback: progress_callback(10, 100, "等待图片加载...")
-            try:
-                page.wait_for_selector('.z_content img', timeout=15000)
-                time.sleep(2)
-                page.wait_for_function("""
+            def _collect_img_urls():
+                raw_urls = page.evaluate("""
                     () => {
-                        const imgs = document.querySelectorAll('.z_content img');
-                        if (imgs.length === 0) return false;
-                        let loadedCount = 0;
-                        for (let img of imgs) {
-                            if (img.complete && img.naturalHeight !== 0) loadedCount++;
-                        }
-                        return loadedCount === imgs.length;
+                        const pick = (img) => {
+                            const attrs = [
+                                img.getAttribute('data-src'),
+                                img.getAttribute('data-lazy-src'),
+                                img.getAttribute('data-original'),
+                                img.getAttribute('data-echo'),
+                                img.getAttribute('src')
+                            ];
+                            for (const v of attrs) {
+                                if (v && typeof v === 'string' && v.trim()) return v.trim();
+                            }
+                            const srcset = img.getAttribute('srcset');
+                            if (srcset && typeof srcset === 'string') {
+                                const first = srcset.split(',')[0];
+                                if (first) {
+                                    const urlPart = first.trim().split(' ')[0];
+                                    if (urlPart) return urlPart.trim();
+                                }
+                            }
+                            return '';
+                        };
+                        const imgs = Array.from(document.querySelectorAll('.z_content img'));
+                        return imgs.map(pick).filter(Boolean);
                     }
-                """, timeout=20000)
-            except:
-                pass
+                """)
+                urls = []
+                for u in raw_urls or []:
+                    u = (u or "").strip()
+                    if not u:
+                        continue
+                    if u.startswith("data:") or u == "about:blank":
+                        continue
+                    abs_url = urllib.parse.urljoin(chapter_url, u)
+                    if abs_url not in urls:
+                        urls.append(abs_url)
+                return urls
+
+            def _get_img_load_state():
+                try:
+                    return page.evaluate("""
+                        () => {
+                            const imgs = Array.from(document.querySelectorAll('.z_content img'));
+                            let loaded = 0;
+                            for (const img of imgs) {
+                                if (img.complete && img.naturalHeight !== 0) loaded++;
+                            }
+                            return { total: imgs.length, loaded };
+                        }
+                    """)
+                except:
+                    return {"total": 0, "loaded": 0}
+
+            if progress_callback: progress_callback(10, 100, "等待图片加载...")
+            page.wait_for_selector('.z_content img', timeout=30000)
 
             img_urls = []
-            max_retries_loop = 3
-            downloaded_count = 0
+            stable_rounds = 0
+            last_count = 0
+            start_ts = time.time()
+            max_discovery_seconds = 60
 
-            for attempt in range(max_retries_loop):
-                current_img_elements = page.locator('.z_content img').all()
-                current_urls = []
-                for img in current_img_elements:
-                    src = img.get_attribute('src')
-                    if src and src not in current_urls:
-                        current_urls.append(src)
-                
-                new_urls = [url for url in current_urls if url not in img_urls]
-                if not new_urls: break
-                
-                start_index = len(img_urls)
-                img_urls.extend(new_urls)
-                total_imgs = len(img_urls)
-                
-                max_threads = 5  # 可同时下载的图片数量
-                
-                with ThreadPoolExecutor(max_workers=max_threads) as executor:
-                    futures = {}
-                    for local_idx, img_url in enumerate(new_urls):
-                        real_index = start_index + local_idx + 1
-                        file_name = f"{str(real_index).zfill(3)}.jpg"
-                        save_path = chapter_dir / file_name
-                        
-                        # 提交到线程池
-                        future = executor.submit(self._download_and_convert_image, img_url, str(save_path), chapter_url, user_agent)
-                        futures[future] = real_index
-                        
-                    for future in as_completed(futures):
-                        # 如果用户点击了取消，立刻停止阻塞，退出循环
-                        if cancel_check and cancel_check():
-                            break
-                            
-                        success = future.result()
-                        if success:
-                            downloaded_count += 1
-                        
-                        if progress_callback: 
-                            progress_callback(downloaded_count, total_imgs, f"图片下载并发中: {downloaded_count}/{total_imgs}")
-                
-                # 若已取消，直接向外抛出失败以中断后续重试
+            while True:
                 if cancel_check and cancel_check():
                     return False, None
-                # --- [重写结束] ---
-            
-            if downloaded_count > 0:
-                if progress_callback: progress_callback(100, 100, f"完成: 下载 {downloaded_count} 张图")
+
+                img_urls = _collect_img_urls()
+                load_state = _get_img_load_state()
+                total_dom_imgs = int((load_state or {}).get("total") or 0)
+                loaded_dom_imgs = int((load_state or {}).get("loaded") or 0)
+
+                if progress_callback:
+                    progress_callback(10, 100, f"发现图片: {len(img_urls)} 张 (已加载 {loaded_dom_imgs}/{total_dom_imgs})")
+
+                if len(img_urls) == last_count:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                    last_count = len(img_urls)
+
+                if len(img_urls) > 0 and stable_rounds >= 3 and total_dom_imgs > 0 and loaded_dom_imgs >= total_dom_imgs:
+                    break
+
+                if time.time() - start_ts > max_discovery_seconds and len(img_urls) > 0 and stable_rounds >= 2:
+                    break
+
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except:
+                    pass
+                time.sleep(0.8)
+
+            total_imgs = len(img_urls)
+            if total_imgs == 0:
+                return False, None
+
+            if progress_callback:
+                progress_callback(10, total_imgs, f"开始下载: 共 {total_imgs} 张")
+
+            max_threads = min(5, total_imgs)
+            max_download_rounds = 3
+            succeeded = set()
+
+            download_queue = [(idx, img_url) for idx, img_url in enumerate(img_urls, start=1)]
+            for round_idx in range(max_download_rounds):
+                if cancel_check and cancel_check():
+                    return False, None
+
+                tasks = []
+                for idx, img_url in download_queue:
+                    if idx in succeeded:
+                        continue
+                    save_path = chapter_dir / f"{str(idx).zfill(3)}.jpg"
+                    try:
+                        if save_path.exists() and save_path.stat().st_size > 0:
+                            succeeded.add(idx)
+                            continue
+                    except:
+                        pass
+                    tasks.append((idx, img_url, str(save_path)))
+
+                if not tasks:
+                    break
+
+                with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                    futures = {}
+                    for idx, img_url, save_path in tasks:
+                        future = executor.submit(self._download_and_convert_image, img_url, save_path, chapter_url, user_agent)
+                        futures[future] = idx
+
+                    for future in as_completed(futures):
+                        if cancel_check and cancel_check():
+                            return False, None
+
+                        idx = futures[future]
+                        ok = False
+                        try:
+                            ok = future.result()
+                        except:
+                            ok = False
+
+                        if ok:
+                            succeeded.add(idx)
+
+                        if progress_callback:
+                            progress_callback(len(succeeded), total_imgs, f"下载图片: {len(succeeded)}/{total_imgs}")
+
+                if len(succeeded) >= total_imgs:
+                    break
+
+                time.sleep(1.2)
+
+            if len(succeeded) >= total_imgs and total_imgs > 0:
+                if progress_callback: progress_callback(100, 100, f"完成: 下载 {len(succeeded)} 张图")
                 return True, str(chapter_dir)
             return False, None
 
@@ -203,6 +299,7 @@ class KlMangaScraper(BaseScraper):
             page.close()
 
     def download_manga_cover(self, context, manga_url, save_dir):
+        manga_url = self._fix_url(manga_url)
         page = context.new_page()
         try:
             page.goto(manga_url, wait_until="domcontentloaded")
