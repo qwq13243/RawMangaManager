@@ -1,0 +1,56 @@
+# ==========================
+# 专为你项目定制的忽略规则
+# ==========================
+
+# 1. 忽略超大文件夹（导致 380MB 的元凶！）
+ms-playwright/
+tmp_download/
+covers/
+debug/
+models/
+downloads/
+temp/
+
+# 2. 忽略本地生成的数据库文件、日志和快捷方式
+manga_manager.db
+*.lnk
+*.log
+*.tmp
+
+# 3. 忽略 Python 运行自动产生的缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# 4. 忽略虚拟环境与编辑器配置
+venv/
+.venv/
+env/
+.env/
+.vscode/
+.idea/
+.DS_Store
+
+# 5. 忽略采集、下载或处理过程中的图片文件
+# 屏蔽常见的位图格式，防止采集的漫画或封面进入仓库
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.ico
+
+# 如果你的 GUI 界面使用了特定的图标素材（比如放在 assets 文件夹下），
+# 请取消下面两行的注释，以确保必要的素材能被提交：
+# !assets/*.png
+# !assets/*.ico
+
+# 6. 忽略压缩包与大文件
+*.7z
+*.zip
+*.rar
+*.tar.gz
