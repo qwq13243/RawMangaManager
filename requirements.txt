@@ -1,0 +1,14 @@
+PySide6
+requests
+urllib3
+beautifulsoup4
+gdown
+Pillow
+numpy
+opencv-python
+torch
+einops
+manga-ocr
+protobuf
+openai
+httpx
