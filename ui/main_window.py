@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self.container = MangaGridWidget()
         # 连接信号
         self.container.orderChanged.connect(self.on_drag_reorder)
+        self.container.dragMovedSignal.connect(self.on_drag_move_preview)
         
         self.grid_layout = QGridLayout(self.container)
         self.grid_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -220,6 +221,48 @@ class MainWindow(QMainWindow):
         
         menu.exec(QCursor.pos())
 
+    def on_drag_move_preview(self, source_id, pos):
+        if not hasattr(self, 'current_cards') or not self.current_cards:
+            return
+            
+        # 计算目标索引
+        width = self.scroll.viewport().width() - 30
+        card_width = 150
+        spacing = 15
+        col_count = max(1, (width + spacing) // (card_width + spacing))
+        
+        card_height = 245
+        row_height = card_height + spacing
+        col_width = card_width + spacing
+        
+        target_row = max(0, pos.y() // row_height)
+        target_col = max(0, pos.x() // col_width)
+        
+        if target_col >= col_count:
+            target_col = col_count - 1
+            
+        target_index = target_row * col_count + target_col
+        
+        if target_index >= len(self.current_cards):
+            target_index = len(self.current_cards) - 1
+            
+        # 找到当前拖拽的卡片在 current_cards 中的位置
+        source_idx = -1
+        for i, card in enumerate(self.current_cards):
+            if card.manga_id == source_id:
+                source_idx = i
+                break
+                
+        if source_idx == -1 or source_idx == target_index:
+            return
+            
+        # 在列表中移动
+        card = self.current_cards.pop(source_idx)
+        self.current_cards.insert(target_index, card)
+        
+        # 重新排布网格以实现让位效果
+        self.reflow_grid()
+
     def on_drag_reorder(self, source_id, pos):
         self._dbg(f"[UI][{time.strftime('%H:%M:%S')}] dragDrop source_id={source_id} pos={pos.x()},{pos.y()}")
         # 1. 获取当前列表
@@ -348,18 +391,6 @@ class MainWindow(QMainWindow):
             title = zh if zh else (jp if jp else romaji)
             
             chapters = db.get_chapters(m_id)
-            border_color = "#EEE"
-            if chapters:
-                latest = chapters[0]
-                is_dl = latest[4]
-                is_trans = latest[7]
-                
-                # 严格判定边界颜色
-                if is_dl == 0 and is_trans == 0:
-                    border_color = "#FFFF00"
-                elif is_dl == 1 and is_trans == 0:
-                    border_color = "#00FFFF"
-            
             # 计算阅读进度
             total_chapters = len(chapters)
             
@@ -397,6 +428,24 @@ class MainWindow(QMainWindow):
             elif total_chapters == 0:
                 status_indicator_color = "#9E9E9E" # 灰色（无章节）
                 status_indicator_tooltip = "暂无章节"
+
+            # 重新判断边框颜色逻辑
+            border_color = "transparent" # 默认无色（最新章是已读状态就无色）
+            if chapters:
+                latest = chapters[0]
+                is_dl = latest[4]
+                is_trans = latest[7]
+                read_status = latest[8]
+                
+                if is_dl == 0 or is_trans == 0:
+                    # 最新章节是未下载未翻译状态就黄色
+                    border_color = "#FFFF00"
+                elif read_status != 2:
+                    # 最新章不是已读状态就蓝色
+                    border_color = "#2196F3" # 蓝色
+                else:
+                    # 最新章是已读状态就无色
+                    border_color = "transparent"
 
             card = DraggableCard(m_id)
             # 连接拖拽信号，管理刷新锁
@@ -735,7 +784,7 @@ class MainWindow(QMainWindow):
         self.active_dlgs.append(dlg) # 防止被Python垃圾回收
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.finished.connect(lambda: self.active_dlgs.remove(dlg) if dlg in self.active_dlgs else None)
-        dlg.finished.connect(self.refresh_grid)
+        dlg.finished.connect(self.request_refresh)
         dlg.show()  # 替代原先的 dlg.exec()
 
     def start_cover_download(self, manga_id, url, source, folder_name):

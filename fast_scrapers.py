@@ -128,13 +128,107 @@ class KlMangaFastScraper(BaseFastScraper):
     source_name = "KlManga"
 
     def __init__(self, base_domain="klmanga.voto"):
-        self.base_domain = base_domain.replace('https://', '').replace('http://', '').strip('/')
-        self.base_url = f"https://{self.base_domain}"
+        self._fallback_suffixes = ["mom", "voto", "com", "net", "org", "xyz", "me", "cc"]
+        self._known_suffixes = []
+        self.base_domain = ""
+        self.base_url = ""
+        self._set_base_domain(base_domain)
         super().__init__()
+
+    def _normalize_domain(self, domain):
+        if not domain:
+            return ""
+        normalized = str(domain).replace('https://', '').replace('http://', '').strip('/').lower()
+        if normalized.startswith("www."):
+            normalized = normalized[4:]
+        return normalized
+
+    def _extract_klmanga_domain(self, url):
+        if not url:
+            return ""
+        raw = str(url).strip()
+        if not raw:
+            return ""
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+        host = self._normalize_domain(parsed.netloc or parsed.path.split('/')[0])
+        return host if re.fullmatch(r'klmanga\.[a-z0-9-]+', host) else ""
+
+    def _set_base_domain(self, domain):
+        normalized = self._normalize_domain(domain)
+        if not normalized:
+            return
+        if not re.fullmatch(r'klmanga\.[a-z0-9-]+', normalized):
+            return
+        suffix = normalized.split('.', 1)[1]
+        if suffix and suffix not in self._known_suffixes:
+            self._known_suffixes.append(suffix)
+        self.base_domain = normalized
+        self.base_url = f"https://{self.base_domain}"
+
+    def _remember_domain_from_url(self, url):
+        extracted = self._extract_klmanga_domain(url)
+        if extracted and extracted != self.base_domain:
+            self._set_base_domain(extracted)
+
+    def _candidate_domains(self):
+        seen_suffixes = []
+        for suffix in self._known_suffixes + self._fallback_suffixes:
+            if suffix and suffix not in seen_suffixes:
+                seen_suffixes.append(suffix)
+        candidates = [self.base_domain] if self.base_domain else []
+        for suffix in seen_suffixes:
+            domain = f"klmanga.{suffix}"
+            if domain not in candidates:
+                candidates.append(domain)
+        return candidates
+
+    def _request(self, method, url, **kwargs):
+        request_kwargs = dict(kwargs)
+        
+        def _do_req(req_url):
+            resp = super(KlMangaFastScraper, self)._request(method, req_url, **dict(request_kwargs))
+            resp.raise_for_status()
+            
+            final_domain = self._normalize_domain(urllib.parse.urlparse(resp.url).netloc)
+            if final_domain and not re.fullmatch(r'klmanga\.[a-z0-9-]+', final_domain):
+                raise requests.RequestException(f"Redirected to invalid domain: {final_domain}")
+                
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if "text/html" in ctype:
+                text = resp.text
+                if not re.search(r'(wp-content|wp-includes|ajax_url|chapter-box|reading_chapter|main-thumb)', text, re.IGNORECASE):
+                    raise requests.RequestException("Invalid page content (parked domain?)")
+            return resp
+
+        try:
+            response = _do_req(url)
+            self._remember_domain_from_url(getattr(response, "url", ""))
+            return response
+        except requests.RequestException as first_error:
+            parsed = urllib.parse.urlparse(str(url))
+            host = self._normalize_domain(parsed.netloc)
+            if not re.fullmatch(r'klmanga\.[a-z0-9-]+', host):
+                raise first_error
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            for candidate_domain in self._candidate_domains():
+                if candidate_domain == host:
+                    continue
+                retry_url = f"https://{candidate_domain}{path}"
+                try:
+                    response = _do_req(retry_url)
+                    self._set_base_domain(candidate_domain)
+                    self._remember_domain_from_url(getattr(response, "url", ""))
+                    return response
+                except requests.RequestException:
+                    continue
+            raise first_error
 
     def _fix_url(self, url):
         if url:
-            return re.sub(r'https?://(?:www\.)?klmanga\.[a-z]+', self.base_url, url)
+            # 只在修正时替换成当前证明可用的 base_url，而不从待修正的未知 url 中反向学习域名
+            return re.sub(r'https?://(?:www\.)?klmanga\.[a-z0-9-]+', self.base_url, url)
         return url
 
     def search(self, keyword):
@@ -171,20 +265,35 @@ class KlMangaFastScraper(BaseFastScraper):
             cover_url = self._fix_url(cover_match.group(1))
 
         chapters = []
+        # 使用更精确的查找，避免抓取到侧边栏或其他推荐漫画的章节
+        # klmanga 的章节列表通常包含在特定的容器内，比如 id="chapter-list" 或带有 list-group 类的 div
         chapter_box_start = html_text.find('chapter-box')
         if chapter_box_start != -1:
             chapter_box_html = html_text[chapter_box_start:chapter_box_start + 50000]
+            # 为了防止跨界到其他区块，在找到相关的结束标签（如另一个大的区块开始）时截断
+            end_idx = chapter_box_html.find('class="related-manga"')
+            if end_idx != -1:
+                chapter_box_html = chapter_box_html[:end_idx]
+                
             a_matches = re.findall(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>', chapter_box_html, re.DOTALL | re.IGNORECASE)
             for href, inner_text in a_matches:
                 title_text = re.sub(r'<[^>]+>', '', inner_text).strip()
                 title_text = re.sub(r'\s+New$', '', title_text, flags=re.IGNORECASE).strip()
+                # 进一步过滤：确保 href 中包含当前 manga_url 的 slug，或者确保它看起来真的像本漫画的章节
+                # 某些时候 href 会跳到其他漫画
+                manga_slug = [x for x in urllib.parse.urlparse(manga_url).path.split('/') if x][-1]
+                
+                # 特别过滤掉相关推荐中的漫画，比如 href 中不带 chapter- 的其他漫画链接
                 if title_text and ('chapter' in href.lower() or '第' in title_text or re.search(r'\d+', title_text)):
-                    chapters.append({"title": clean_filename(title_text), "url": self._fix_url(href), "source": self.source_name})
+                    if manga_slug in href or '/chapter-' in href.lower():
+                        chapters.append({"title": clean_filename(title_text), "url": self._fix_url(href), "source": self.source_name})
         else:
+            # 备用方案，只寻找明确属于本漫画的章节链接
+            manga_slug = [x for x in urllib.parse.urlparse(manga_url).path.split('/') if x][-1]
             a_matches = re.findall(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*class=[\'"][^\'"]*d-inline-flex[^\'"]*[\'"][^>]*>(.*?)</a>', html_text, re.IGNORECASE | re.DOTALL)
             for href, inner_text in a_matches:
                 title_text = re.sub(r'<[^>]+>', '', inner_text).strip()
-                if title_text:
+                if title_text and (manga_slug in href or '/chapter-' in href.lower()):
                     chapters.append({"title": clean_filename(title_text), "url": self._fix_url(href), "source": self.source_name})
 
         return cover_url, chapters
@@ -201,6 +310,10 @@ class KlMangaFastScraper(BaseFastScraper):
 
         res = self._request("GET", chapter_url, headers={**self.headers, "Referer": self.base_url})
         res.raise_for_status()
+        
+        # 更新 chapter_url 为最终跳转后的实际地址，防止跨域验证拦截（例如旧域名跳转到了新域名）
+        chapter_url = getattr(res, "url", chapter_url)
+        
         html_text = res.text
 
         nonce_match = re.search(r'"nonce_a":"([^"]+)"', html_text)
@@ -242,7 +355,10 @@ class KlMangaFastScraper(BaseFastScraper):
                 req_payload["img_index"] = img_index
                 req_payload["content"] = content_html
                 post_res = self._request("POST", ajax_url, headers=api_headers, data=req_payload)
-                res_data = post_res.json()
+                try:
+                    res_data = post_res.json()
+                except Exception:
+                    res_data = {}
                 mes_html = res_data.get("mes", "")
                 before = len(all_image_urls)
                 collect_urls(mes_html)

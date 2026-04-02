@@ -1137,11 +1137,11 @@ class DetailDialog(QDialog):
                         self.trans_thread.finished_all.disconnect()
                     except: pass
                     self.trans_thread.cancel()
-                event.accept()
+                super().closeEvent(event)
             else:
                 event.ignore()
         else:
-            event.accept()
+            super().closeEvent(event)
 
     def start_translator_server(self):
         exe = db.get_setting("translator_path")
@@ -1309,6 +1309,11 @@ class AddMangaDialog(QDialog):
                         try: t.finished_signal.disconnect()
                         except: pass
                         t.cancel()
+                super().closeEvent(event)
+            else:
+                event.ignore()
+        else:
+            super().closeEvent(event)
 
     def on_single_search_done(self, result):
         if result.get('type') == 'search_item':

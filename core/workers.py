@@ -127,14 +127,18 @@ class WorkerThread(QThread):
                     
                     self.progress_signal.emit(f"{prefix}[开始] {ch_str} - {source_site}")
                     
-                    success, saved_path = scraper.download_chapter(
-                        manga_save_path=save_dir,
-                        chapter_title=safe_title,
-                        chapter_url=chapter_url,
-                        progress_callback=lambda curr, total, msg: self.progress_signal.emit(f"{prefix}[{ch_str}] {msg}"),
-                        cancel_check=lambda: self.is_cancelled,
-                        dl_url=dl_url
-                    )
+                    try:
+                        success, saved_path = scraper.download_chapter(
+                            manga_save_path=save_dir,
+                            chapter_title=safe_title,
+                            chapter_url=chapter_url,
+                            progress_callback=lambda curr, total, msg: self.progress_signal.emit(f"{prefix}[{ch_str}] {msg}"),
+                            cancel_check=lambda: self.is_cancelled,
+                            dl_url=dl_url
+                        )
+                    except Exception as e:
+                        self.progress_signal.emit(f"{prefix}[错误] {ch_str} 下载发生异常: {str(e)}")
+                        success, saved_path = False, None
                     
                     if success and saved_path:
                         import glob
@@ -147,6 +151,8 @@ class WorkerThread(QThread):
                         db.mark_chapter_downloaded(cap_id, saved_path)
                         self.finished_signal.emit({"type": "progress", "id": cap_id})
                         self.progress_signal.emit(f"[成功] {ch_str} 保存至: {saved_path}")
+                    else:
+                        self.progress_signal.emit(f"{prefix}[失败] {ch_str} 下载未成功 (可能因链接失效或获取不到图片)")
 
                 self.finished_signal.emit({"type": "done"})
             

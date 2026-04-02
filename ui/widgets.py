@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QPushButton, QWidget, QApplication
 from PySide6.QtCore import Qt, Signal, QTimer, QMimeData, QPoint
-from PySide6.QtGui import QDrag
+from PySide6.QtGui import QDrag, QPixmap, QPainter, QColor
 import os
 import time
 
@@ -66,15 +66,49 @@ class DraggableCard(QPushButton):
         mime.setText(str(self.manga_id))
         drag.setMimeData(mime)
         
-        # 设置拖拽时的视觉反馈 (半透明截图)
-        pixmap = self.grab()
-        drag.setPixmap(pixmap)
-        drag.setHotSpot(self.rect().center()) # 中心对齐
+        # 设置拖拽时的视觉反馈 (App式的悬浮感动效)
+        original_pixmap = self.grab()
+        
+        # 将原始截图放大一点并添加半透明度来制造“被提起”的效果
+        scale_factor = 1.05
+        new_width = int(original_pixmap.width() * scale_factor)
+        new_height = int(original_pixmap.height() * scale_factor)
+        
+        scaled_pixmap = original_pixmap.scaled(new_width, new_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        
+        # 创建一个带有阴影边距和透明通道的透明画布
+        shadow_margin = 10
+        canvas_width = new_width + shadow_margin * 2
+        canvas_height = new_height + shadow_margin * 2
+        drag_pixmap = QPixmap(canvas_width, canvas_height)
+        drag_pixmap.fill(Qt.transparent)
+        
+        painter = QPainter(drag_pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制半透明的阴影
+        painter.setBrush(QColor(0, 0, 0, 60))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(shadow_margin + 5, shadow_margin + 5, new_width, new_height, 8, 8)
+        
+        # 绘制卡片本体（增加一点全局透明度，使得不会完全遮挡底下的界面）
+        painter.setOpacity(0.9)
+        painter.drawPixmap(shadow_margin, shadow_margin, scaled_pixmap)
+        painter.end()
+
+        drag.setPixmap(drag_pixmap)
+        # 将抓取点对准放大的图片的中心（修正上阴影带来的偏移）
+        drag.setHotSpot(QPoint(drag_pixmap.width() // 2, drag_pixmap.height() // 2))
+        
+        # 隐藏自身，制造“卡片被拿起来带走”的错觉
+        self.setHidden(True)
         
         # 执行拖拽
         result = drag.exec_(Qt.MoveAction)
         self._dbg(f"drag finished result={int(result)}")
         
+        # 拖拽结束恢复显示
+        self.setHidden(False)
         self.dragFinished.emit()
 
 class MangaGridWidget(QWidget):
@@ -82,6 +116,7 @@ class MangaGridWidget(QWidget):
     支持拖放的网格容器
     """
     orderChanged = Signal(int, QPoint) # source_id, drop_pos
+    dragMovedSignal = Signal(int, QPoint) # source_id, hover_pos
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -102,6 +137,11 @@ class MangaGridWidget(QWidget):
     def dragMoveEvent(self, event):
         if event.mimeData().hasText():
             self._dbg(f"dragMove pos={event.pos().x()},{event.pos().y()} text={event.mimeData().text()}")
+            try:
+                source_id = int(event.mimeData().text())
+                self.dragMovedSignal.emit(source_id, event.pos())
+            except ValueError:
+                pass
             event.acceptProposedAction()
 
     def dropEvent(self, event):
